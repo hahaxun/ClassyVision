@@ -11,7 +11,6 @@ import logging
 import math
 import multiprocessing as mp
 import time
-from itertools import chain
 from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 import torch
@@ -25,17 +24,22 @@ from classy_vision.generic.distributed_util import (
     is_distributed_training_run,
 )
 from classy_vision.generic.util import (
+    Timer,
     copy_model_to_gpu,
     load_and_broadcast_checkpoint,
     recursive_copy_to_gpu,
     split_batchnorm_params,
     update_classy_state,
 )
-from classy_vision.hooks import build_hooks
+from classy_vision.hooks import CheckpointHook, ClassyHook, build_hooks
 from classy_vision.losses import ClassyLoss, build_loss
-from classy_vision.meters import build_meters
+from classy_vision.meters import ClassyMeter, build_meters
 from classy_vision.models import ClassyModel, build_model
-from classy_vision.optim import ClassyOptimizer, build_optimizer
+from classy_vision.optim import (
+    ClassyOptimizer,
+    build_optimizer,
+    build_optimizer_schedulers,
+)
 from torch.distributed import broadcast
 
 from . import register_task
@@ -73,6 +77,7 @@ class LastBatchInfo(NamedTuple):
     output: torch.Tensor
     target: torch.Tensor
     sample: Dict[str, Any]
+    step_data: Dict[str, Any]
 
 
 @register_task("classification_task")
@@ -101,6 +106,8 @@ class ClassificationTask(ClassyTask):
     :var test_only: Used to only run the test phase
     :var base_model: Model to be trained, unwrapped in DDP or DP wrappers
     :var optimizer: Optimizer used in train step
+    :var optimizer_schedulers: Dictionary. Key is the name of the optimizer
+        option (e.g. lr), value is a ClassyParamScheduler
     :var checkpoint: Serializable dict which represents state in training
     :var phases: List of phase specific information, e.g. if phase is
         train / test.
@@ -116,15 +123,13 @@ class ClassificationTask(ClassyTask):
     :var data_iterator: Iterator which can be used to obtain batches
     :var losses: Loss curve
     :var perf_log: list of training speed measurements, to be logged
-
     """
 
     def __init__(self):
-        """Constructs a ClassificationTask
-        """
+        """Constructs a ClassificationTask"""
         super().__init__()
 
-        self.loss = None
+        self.base_loss = None
         self.datasets = {}
         self.meters = []
         self.num_epochs = 1
@@ -133,15 +138,18 @@ class ClassificationTask(ClassyTask):
         self.test_only = False
         self.base_model = None
         self.optimizer = None
+        self.optimizer_schedulers = {}
         self.checkpoint_dict = None
         self.checkpoint_path = None
         self.phases = []
         self.hooks = []
         self.train = True
         self.distributed_model = None
+        self.distributed_loss = None
         self.phase_idx = -1
         self.train_phase_idx = -1
         self.num_updates = 0
+        self.dataloader = None
         self.data_iterator = None
         self.losses = []
         self.broadcast_buffers_mode: BroadcastBuffersMode = (
@@ -222,10 +230,11 @@ class ClassificationTask(ClassyTask):
             self._train_only = False
         return self
 
-    def set_dataloader_mp_context(self, dataloader_mp_context: str):
+    def set_dataloader_mp_context(self, dataloader_mp_context: Optional[str]):
         """Set the multiprocessing context used by the dataloader.
 
-        The context can be either 'spawn', 'fork' or 'forkserver'. See
+        The context can be either 'spawn', 'fork', 'forkserver' or None (uses the
+        default context). See
         https://docs.python.org/3/library/multiprocessing.html#multiprocessing.get_context
         for more details."""
 
@@ -247,7 +256,7 @@ class ClassificationTask(ClassyTask):
         Args:
             loss: loss for task
         """
-        self.loss = loss
+        self.base_loss = loss
         return self
 
     def set_meters(self, meters: List["ClassyMeter"]):
@@ -324,7 +333,14 @@ class ClassificationTask(ClassyTask):
         assert len({hook.name() for hook in hooks}) == len(
             hooks
         ), "Cannot have repeated hooks of the same class"
-
+        # TODO (zyan3): we move checkpoint hook to the end of the list because some hooks
+        # may change the state of the model, and we want to save changed state in the checkpoint.
+        # This is temporary fix.
+        non_checkpoint_hooks = [
+            hook for hook in hooks if not isinstance(hook, CheckpointHook)
+        ]
+        checkpoint_hooks = [hook for hook in hooks if isinstance(hook, CheckpointHook)]
+        hooks = non_checkpoint_hooks + checkpoint_hooks
         self.hooks = hooks
         return self
 
@@ -371,7 +387,7 @@ class ClassificationTask(ClassyTask):
         self.amp_args = amp_args
 
         if amp_args is None:
-            logging.info(f"AMP disabled")
+            logging.info("AMP disabled")
         else:
             if not apex_available:
                 raise RuntimeError("apex is not installed, cannot enable amp")
@@ -387,9 +403,13 @@ class ClassificationTask(ClassyTask):
         """
         self.mixup_transform = mixup_transform
         if mixup_transform is None:
-            logging.info(f"mixup disabled")
+            logging.info("mixup disabled")
         else:
-            logging.info(f"mixup enabled")
+            logging.info("mixup enabled")
+        return self
+
+    def set_optimizer_schedulers(self, schedulers):
+        self.optimizer_schedulers = schedulers
         return self
 
     @classmethod
@@ -415,6 +435,7 @@ class ClassificationTask(ClassyTask):
                 config["num_epochs"] * train_phases_per_epoch
             )
             optimizer = build_optimizer(optimizer_config)
+            param_schedulers = build_optimizer_schedulers(optimizer_config)
 
         datasets = {}
         phase_types = ["train", "test"]
@@ -472,6 +493,7 @@ class ClassificationTask(ClassyTask):
 
         if not test_only:
             task.set_optimizer(optimizer)
+            task.set_optimizer_schedulers(param_schedulers)
 
         use_gpu = config.get("use_gpu")
         if use_gpu is not None:
@@ -488,34 +510,30 @@ class ClassificationTask(ClassyTask):
 
     @property
     def num_batches_per_phase(self):
-        """Returns number of batches in current phase iterator
-        """
+        """Returns number of batches in current phase iterator"""
         return len(self.data_iterator)
 
     @property
     def model(self):
-        """Returns model used in training (can be wrapped with DDP)
-        """
+        """Returns model used in training (can be wrapped with DDP)"""
         return (
             self.distributed_model if is_distributed_training_run() else self.base_model
         )
 
     @property
+    def loss(self):
+        """Returns loss used in training (can be wrapped with DDP)"""
+        return self.distributed_loss if self.distributed_loss else self.base_loss
+
+    @property
     def phase_type(self):
-        """Returns current phase type. String with value "train" or "test"
-        """
+        """Returns current phase type. String with value "train" or "test" """
         return "train" if self.train else "test"
 
     @property
     def eval_phase_idx(self):
-        """Returns current evaluation phase
-        """
+        """Returns current evaluation phase"""
         return self.phase_idx - self.train_phase_idx - 1
-
-    def get_data_iterator(self):
-        """Returns data iterator for current phase
-        """
-        return self.data_iterator
 
     def get_total_training_phases(self):
         """
@@ -575,72 +593,53 @@ class ClassificationTask(ClassyTask):
 
         return [{"train": False} for _ in range(self.num_epochs)]
 
-    def build_dataloader(self, phase_type, pin_memory, **kwargs):
-        """Builds a dataloader iterable for a particular phase type.
+    def build_dataloader_from_dataset(self, dataset, **kwargs):
+        """Builds a dataloader from the provided dataset
 
         Args:
-            phase_type: "train" or "test" iterable
-            pin_memory: if true pin memory on GPU. See PyTorch dataloader
-                documentation for details on ``pin_memory``.
-        Returns:
-            Returns a iterable over the dataset
+            dataset: A ClassyDataset
+            kwargs: Additional kwargs to pass during dataloader construction for
+                derived classes
         """
-        return self.datasets[phase_type].iterator(
-            pin_memory=pin_memory, phase_type=phase_type, **kwargs
+        return dataset.iterator(
+            phase_type=self.phase_type,
+            current_phase_id=self.train_phase_idx if self.train else 0,
+            pin_memory=self.use_gpu and torch.cuda.device_count() > 1,
+            multiprocessing_context=mp.get_context(self.dataloader_mp_context),
+            **kwargs,
         )
 
-    def build_dataloaders(self, pin_memory, **kwargs):
-        """Build a dataloader for each phase type
+    def build_dataloaders_for_current_phase(self):
+        """Builds dataloader(s) for the current phase.
 
-        Args:
-            pin_memory: if true pin memory on GPU. See PyTorch dataloader
-                documentation for details on pin_memory.
-        Returns:
-            Returns an iterable over the dataset associated with each phase_type
+        Deriving classes can override this method to support custom behavior, like
+        supporting multiple dataloaders in parallel.
         """
-        return {
-            phase_type: self.build_dataloader(
-                phase_type, pin_memory=pin_memory, **kwargs
-            )
-            for phase_type in self.datasets.keys()
-        }
+        self.dataloader = self.build_dataloader_from_dataset(
+            self.datasets[self.phase_type]
+        )
 
     def prepare_optimizer(self, optimizer, model, loss=None):
+        bn_params, other_params = split_batchnorm_params(model)
+        if loss is not None:
+            bn_params_loss, params_loss = split_batchnorm_params(loss)
+            bn_params = bn_params + bn_params_loss
+            other_params = other_params + params_loss
+
+        bn_schedulers = self.optimizer_schedulers.copy()
         if not self.bn_weight_decay:
-            bn_params, params = split_batchnorm_params(model)
-            if loss is not None:
-                bn_params_loss, params_loss = split_batchnorm_params(loss)
-                bn_params = bn_params + bn_params_loss
-                params = params + params_loss
+            bn_schedulers["weight_decay"] = 0
 
-            frozen_param_groups = (
-                {"params": bn_params, "weight_decay": 0} if len(bn_params) > 0 else None
-            )
-            param_groups = {"params": params}
-        else:
-            frozen_param_groups = None
-            params = model.parameters()
-            if loss is not None:
-                params = chain(params, loss.parameters())
-
-            param_groups = {"params": list(params)}
-
-        self.optimizer.set_param_groups(
-            param_groups=param_groups, frozen_param_groups=frozen_param_groups
-        )
+        param_groups = [{"params": other_params, **self.optimizer_schedulers}]
+        if len(bn_params) > 0:
+            param_groups.append({"params": bn_params, **bn_schedulers})
+        self.optimizer.set_param_groups(param_groups)
 
     def prepare(self):
         """Prepares task for training, populates all derived attributes """
 
-        pin_memory = self.use_gpu and torch.cuda.device_count() > 1
-
         self.phases = self._build_phases()
         self.train = False if self.test_only else self.train
-        self.dataloaders = self.build_dataloaders(
-            current_phase_id=0,
-            pin_memory=pin_memory,
-            multiprocessing_context=mp.get_context(self.dataloader_mp_context),
-        )
 
         if self.batch_norm_sync_mode == BatchNormSyncMode.PYTORCH:
             self.base_model = nn.SyncBatchNorm.convert_sync_batchnorm(self.base_model)
@@ -654,14 +653,16 @@ class ClassificationTask(ClassyTask):
 
         # move the model and loss to the right device
         if self.use_gpu:
-            self.base_model, self.loss = copy_model_to_gpu(self.base_model, self.loss)
+            self.base_model, self.base_loss = copy_model_to_gpu(
+                self.base_model, self.base_loss
+            )
         else:
-            self.loss.cpu()
+            self.base_loss.cpu()
             self.base_model.cpu()
 
         if self.optimizer is not None:
             self.prepare_optimizer(
-                optimizer=self.optimizer, model=self.base_model, loss=self.loss
+                optimizer=self.optimizer, model=self.base_model, loss=self.base_loss
             )
 
         if self.amp_args is not None:
@@ -718,10 +719,13 @@ class ClassificationTask(ClassyTask):
             broadcast_buffers=broadcast_buffers,
             find_unused_parameters=self.find_unused_parameters,
         )
-        if isinstance(self.loss, ClassyLoss) and self.loss.has_learned_parameters():
+        if (
+            isinstance(self.base_loss, ClassyLoss)
+            and self.base_loss.has_learned_parameters()
+        ):
             logging.info("Initializing distributed loss")
-            self.loss = init_distributed_data_parallel_model(
-                self.loss,
+            self.distributed_loss = init_distributed_data_parallel_model(
+                self.base_loss,
                 broadcast_buffers=broadcast_buffers,
                 find_unused_parameters=self.find_unused_parameters,
             )
@@ -745,8 +749,6 @@ class ClassificationTask(ClassyTask):
 
         num_steps = num_phases * self.num_batches_per_phase
         where = current_step / num_steps
-
-        assert where >= 0 and where < 1, f"Invalid where: {where}"
 
         return where
 
@@ -779,8 +781,8 @@ class ClassificationTask(ClassyTask):
                 "train"
             ].get_classy_state()
 
-        if isinstance(self.loss, ClassyLoss):
-            classy_state_dict["loss"] = self.loss.get_classy_state()
+        if isinstance(self.base_loss, ClassyLoss):
+            classy_state_dict["loss"] = self.base_loss.get_classy_state()
         if self.amp_args is not None:
             classy_state_dict["amp"] = apex.amp.state_dict()
         if deep_copy:
@@ -806,8 +808,8 @@ class ClassificationTask(ClassyTask):
         self.base_model.set_classy_state(state["base_model"])
         if self.optimizer is not None:
             self.optimizer.set_classy_state(state["optimizer"])
-        if state.get("loss") and isinstance(self.loss, ClassyLoss):
-            self.loss.set_classy_state(state["loss"])
+        if state.get("loss") and isinstance(self.base_loss, ClassyLoss):
+            self.base_loss.set_classy_state(state["loss"])
 
         if "amp" in state:
             apex.amp.load_state_dict(state["amp"])
@@ -825,13 +827,6 @@ class ClassificationTask(ClassyTask):
         ):
             self.datasets["train"].set_classy_state(state.get("train_dataset_iterator"))
 
-        # TODO (mannatsingh): Figure out how to set the state of the dataloaders
-        # Re-build dataloader & re-create iterator.
-        self._recreate_data_loader_from_dataset()
-        self.create_data_iterator()
-        # Set up pytorch module in train vs eval mode, update optimizer.
-        self._set_model_train_mode()
-
     @staticmethod
     def _is_checkpointable_dataset(dataset):
         return hasattr(dataset, "get_classy_state") and hasattr(
@@ -842,7 +837,8 @@ class ClassificationTask(ClassyTask):
         self.last_batch = None
 
         # Process next sample
-        sample = next(self.get_data_iterator())
+        with Timer() as timer:
+            sample = next(self.data_iterator)
 
         assert isinstance(sample, dict) and "input" in sample and "target" in sample, (
             f"Returned sample [{sample}] is not a map with 'input' and"
@@ -868,7 +864,11 @@ class ClassificationTask(ClassyTask):
 
         # Move some data to the task so hooks get a chance to access it
         self.last_batch = LastBatchInfo(
-            loss=loss, output=output, target=target, sample=sample
+            loss=loss,
+            output=output,
+            target=target,
+            sample=sample,
+            step_data={"sample_fetch_time": timer.elapsed_time},
         )
 
     def check_inf_nan(self, loss):
@@ -881,7 +881,8 @@ class ClassificationTask(ClassyTask):
         self.last_batch = None
 
         # Process next sample
-        sample = next(self.get_data_iterator())
+        with Timer() as timer:
+            sample = next(self.data_iterator)
 
         assert isinstance(sample, dict) and "input" in sample and "target" in sample, (
             f"Returned sample [{sample}] is not a map with 'input' and"
@@ -920,14 +921,17 @@ class ClassificationTask(ClassyTask):
 
         self.check_inf_nan(loss)
 
-        self.optimizer.update_schedule_on_step(self.where)
-        self.optimizer.step()
+        self.optimizer.step(where=self.where)
 
         self.num_updates += self.get_global_batchsize()
 
         # Move some data to the task so hooks get a chance to access it
         self.last_batch = LastBatchInfo(
-            loss=loss, output=output, target=target, sample=sample
+            loss=loss,
+            output=output,
+            target=target,
+            sample=sample,
+            step_data={"sample_fetch_time": timer.elapsed_time},
         )
 
     def compute_loss(self, model_output, sample):
@@ -972,68 +976,27 @@ class ClassificationTask(ClassyTask):
             self.train_phase_idx += 1
 
         # Re-build dataloader & re-create iterator anytime membership changes.
-        self._recreate_data_loader_from_dataset()
-        self.create_data_iterator()
+        self.build_dataloaders_for_current_phase()
+        self.create_data_iterators()
         # Set up pytorch module in train vs eval mode, update optimizer.
         self._set_model_train_mode()
 
-        # Update the optimizer schedule
-        if self.train and self.train_phase_idx >= 0:
-            self.optimizer.update_schedule_on_epoch(self.where)
-
     def done_training(self):
-        """Stop condition for training
-        """
+        """Stop condition for training"""
         return self.phase_idx + 1 >= len(self.phases)
 
-    def _recreate_data_loader_from_dataset(self, phase_type=None):
-        """
-        This utility is invoked to re-create the data loader object
-        for the current phase of execution, using the existing dataset.
-        This is sufficient when advancing phases.
-        """
-        if phase_type is None:
-            phase_type = self.phase_type
-
-        logging.debug("Recreating data loader for new phase")
-        num_workers = 0
-        if hasattr(self.dataloaders[phase_type], "num_workers"):
-            num_workers = self.dataloaders[phase_type].num_workers
-        pin_memory = False
-        if hasattr(self.dataloaders[phase_type], "pin_memory"):
-            pin_memory = self.dataloaders[phase_type].pin_memory
-        multiprocessing_context = None
-        if hasattr(self.dataloaders[phase_type], "multiprocessing_context"):
-            multiprocessing_context = self.dataloaders[
-                phase_type
-            ].multiprocessing_context
-        if phase_type == "test":
-            current_phase_id = 0
-        else:
-            current_phase_id = max(self.train_phase_idx, 0)
-
-        self.dataloaders[phase_type] = self.build_dataloader(
-            phase_type=phase_type,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            multiprocessing_context=multiprocessing_context,
-            current_phase_id=current_phase_id,
-        )
-
-    def create_data_iterator(self):
-        """Creates data iterator for phase.
-        """
+    def create_data_iterators(self):
+        """Creates data iterator(s) for the current phase."""
         # Delete iterator explicitly so that all dataloader processes
         # are cleaned up.
         del self.data_iterator
-        self.data_iterator = iter(self.dataloaders[self.phase_type])
+        self.data_iterator = iter(self.dataloader)
 
     def _set_model_train_mode(self):
-        """Set train mode for model
-        """
+        """Set train mode for model"""
         phase = self.phases[self.phase_idx]
         self.base_model.train(phase["train"])
-        self.loss.train(phase["train"])
+        self.base_loss.train(phase["train"])
 
         if (
             self.broadcast_buffers_mode == BroadcastBuffersMode.BEFORE_EVAL
@@ -1054,15 +1017,12 @@ class ClassificationTask(ClassyTask):
     # TODO: Functions below should be better abstracted into the dataloader
     # abstraction
     def get_batchsize_per_replica(self):
-        """Return local replica's batchsize for dataset (e.g. batchsize per GPU)
-        """
-        # TODO(T47573564) - cleaner abstraction
-        return self.dataloaders[self.phase_type].dataset.get_batchsize_per_replica()
+        """Return local replica's batchsize for dataset (e.g. batchsize per GPU)"""
+        return self.datasets[self.phase_type].get_batchsize_per_replica()
 
     def get_global_batchsize(self):
-        """Return global batchsize across all trainers
-        """
-        return self.dataloaders[self.phase_type].dataset.get_global_batchsize()
+        """Return global batchsize across all trainers"""
+        return self.datasets[self.phase_type].get_global_batchsize()
 
     def on_start(self):
         for hook in self.hooks:
@@ -1080,6 +1040,9 @@ class ClassificationTask(ClassyTask):
 
     def on_phase_end(self):
         self.log_phase_end("train")
+
+        if self.train:
+            self.optimizer.on_epoch(where=self.where)
 
         logging.debug("Syncing losses on phase end...")
         self.synchronize_losses()

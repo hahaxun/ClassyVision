@@ -15,6 +15,7 @@ _cuda_device_index: int = 0
 
 # Setting _cuda_device_index to -1 internally implies that we should use CPU
 _CPU_DEVICE_INDEX = -1
+_PRIMARY_RANK = 0
 
 
 def convert_to_distributed_tensor(tensor: torch.Tensor) -> Tuple[torch.Tensor, str]:
@@ -51,12 +52,12 @@ def is_distributed_training_run() -> bool:
     )
 
 
-def is_master() -> bool:
+def is_primary() -> bool:
     """
     Returns True if this is rank 0 of a distributed training job OR if it is
     a single trainer job. Otherwise False.
     """
-    return get_rank() == 0
+    return get_rank() == _PRIMARY_RANK
 
 
 def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
@@ -87,6 +88,15 @@ def all_reduce_min(tensor: torch.Tensor) -> torch.Tensor:
     non-distributed scenarios.
     """
     return all_reduce_op(tensor, torch.distributed.ReduceOp.MIN)
+
+
+def all_reduce_max(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper over torch.distributed.all_reduce for performing min
+    reduction of tensor over all processes in both distributed /
+    non-distributed scenarios.
+    """
+    return all_reduce_op(tensor, torch.distributed.ReduceOp.MAX)
 
 
 def all_reduce_op(
@@ -186,6 +196,10 @@ def get_rank() -> int:
     )
 
 
+def get_primary_rank() -> int:
+    return _PRIMARY_RANK
+
+
 def set_cuda_device_index(idx: int) -> None:
     global _cuda_device_index
     _cuda_device_index = idx
@@ -226,20 +240,24 @@ def init_distributed_data_parallel_model(
         )
 
 
-def broadcast_object(obj: Any) -> Any:
-    if is_master():
+def broadcast_object(obj: Any, src: int = _PRIMARY_RANK) -> Any:
+    # Either broadcast from master to the fleet (default),
+    # or use the src setting as the original rank
+    if get_rank() == src:
+        # Emit data
         buffer = io.BytesIO()
         torch.save(obj, buffer)
         data = bytearray(buffer.getbuffer())
         length_tensor = torch.LongTensor([len(data)])
-        length_tensor = broadcast(length_tensor)
+        length_tensor = broadcast(length_tensor, src=src)
         data_tensor = torch.ByteTensor(data)
-        data_tensor = broadcast(data_tensor)
+        data_tensor = broadcast(data_tensor, src=src)
     else:
+        # Fetch from the source
         length_tensor = torch.LongTensor([0])
-        length_tensor = broadcast(length_tensor)
+        length_tensor = broadcast(length_tensor, src=src)
         data_tensor = torch.empty([length_tensor.item()], dtype=torch.uint8)
-        data_tensor = broadcast(data_tensor)
+        data_tensor = broadcast(data_tensor, src=src)
         buffer = io.BytesIO(data_tensor.numpy())
         obj = torch.load(buffer)
     return obj

@@ -58,8 +58,8 @@ class ResNeXt3DBase(ClassyModel):
             stem_maxpool,
         )
 
-    @classmethod
-    def _parse_config(cls, config):
+    @staticmethod
+    def _parse_config(config):
         ret_config = {}
         required_args = [
             "input_planes",
@@ -174,7 +174,7 @@ class ResNeXt3DBase(ClassyModel):
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
                 nn.init.constant_(m.bias, 0)
 
-    def set_classy_state(self, state):
+    def set_classy_state(self, state, strict=True):
         # We need to support both regular checkpoint loading and 2D conv weight
         # inflation into 3D conv weight in this function.
         self.load_head_states(state)
@@ -216,13 +216,13 @@ class ResNeXt3DBase(ClassyModel):
                 assert all(
                     weight_src.size(d) == weight_tgt.size(d)
                     for d in range(weight_src.dim())
-                ), (
-                    "the shapes of source and target weight mismatch: %s Vs %s"
-                    % (str(weight_src.size()), str(weight_tgt.size()))
+                ), "the shapes of source and target weight mismatch: %s Vs %s" % (
+                    str(weight_src.size()),
+                    str(weight_tgt.size()),
                 )
 
             current_state[name] = weight_src.clone()
-        self.load_state_dict(current_state)
+        self.load_state_dict(current_state, strict=strict)
 
         # set the heads back again
         self.set_heads(attached_heads)
@@ -257,13 +257,7 @@ class ResNeXt3DBase(ClassyModel):
         out = self.stem([x])
         out = self.stages(out)
 
-        head_outputs = self.execute_heads()
-        if len(head_outputs) == 0:
-            raise Exception("Expecting at least one head that generates output")
-        elif len(head_outputs) == 1:
-            return list(head_outputs.values())[0]
-        else:
-            return head_outputs
+        return out
 
     @property
     def input_shape(self):
@@ -281,10 +275,6 @@ class ResNeXt3DBase(ClassyModel):
             self.clip_crop_size,
             self.clip_crop_size,
         )
-
-    @property
-    def output_shape(self):
-        return (1, None)
 
     @property
     def model_depth(self):

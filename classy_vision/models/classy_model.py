@@ -6,7 +6,6 @@
 
 import copy
 import types
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -149,6 +148,7 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
     wrapper_cls = ClassyModelHeadExecutorWrapper
 
     _attachable_block_names: List[str]
+    __jit_unused_properties__ = ["attachable_block_names", "head_outputs"]
 
     def __init__(self):
         """Constructor for ClassyModel."""
@@ -175,7 +175,6 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
         cls,
         model: nn.Module,
         input_shape: Optional[Tuple] = None,
-        output_shape: Optional[Tuple] = None,
         model_depth: Optional[int] = None,
     ):
         """Converts an :class:`nn.Module` to a `ClassyModel`.
@@ -188,10 +187,7 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
             A ClassyModel instance.
         """
         return _ClassyModelAdapter(
-            model,
-            input_shape=input_shape,
-            output_shape=output_shape,
-            model_depth=model_depth,
+            model, input_shape=input_shape, model_depth=model_depth
         )
 
     @classmethod
@@ -238,7 +234,7 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
             model_state_dict = copy.deepcopy(model_state_dict)
         return model_state_dict
 
-    def load_head_states(self, state):
+    def load_head_states(self, state, strict=True):
         """Load only the state (weights) of the heads.
 
         For a trunk-heads model, this function allows the user to
@@ -251,9 +247,9 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
         """
         for block_name, head_states in state["model"]["heads"].items():
             for head_name, head_state in head_states.items():
-                self._heads[block_name][head_name].load_state_dict(head_state)
+                self._heads[block_name][head_name].load_state_dict(head_state, strict)
 
-    def set_classy_state(self, state):
+    def set_classy_state(self, state, strict=True):
         """Set the state of the ClassyModel.
 
         Args:
@@ -263,7 +259,7 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
         This is used to load the state of the model from a checkpoint.
         """
         # load the state for heads
-        self.load_head_states(state)
+        self.load_head_states(state, strict)
 
         # clear the heads to set the trunk's state. This is done because when heads are
         # attached to modules, we wrap them by ClassyBlocks, thereby changing the
@@ -271,7 +267,7 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
         # fetched / set when there are no blocks attached.
         attached_heads = self.get_heads()
         self.clear_heads()
-        self.load_state_dict(state["model"]["trunk"])
+        self.load_state_dict(state["model"]["trunk"], strict)
 
         # set the heads back again
         self.set_heads(attached_heads)
@@ -408,20 +404,12 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
 
     @property
     def input_shape(self):
-        """If implemented, returns expected input tensor shape
-        """
-        raise NotImplementedError
-
-    @property
-    def output_shape(self):
-        """If implemented, returns expected output tensor shape
-        """
+        """If implemented, returns expected input tensor shape"""
         raise NotImplementedError
 
     @property
     def model_depth(self):
-        """If implemented, returns number of layers in model
-        """
+        """If implemented, returns number of layers in model"""
         raise NotImplementedError
 
 
@@ -438,13 +426,11 @@ class _ClassyModelAdapter(ClassyModel):
         self,
         model: nn.Module,
         input_shape: Optional[Tuple] = None,
-        output_shape: Optional[Tuple] = None,
         model_depth: Optional[int] = None,
     ):
         super().__init__()
         self.model = model
         self._input_shape = input_shape
-        self._output_shape = output_shape
         self._model_depth = model_depth
 
     def forward(self, x):
@@ -460,12 +446,6 @@ class _ClassyModelAdapter(ClassyModel):
         if self._input_shape is not None:
             return self._input_shape
         return super().input_shape
-
-    @property
-    def output_shape(self):
-        if self._output_shape is not None:
-            return self._output_shape
-        return super().output_shape
 
     @property
     def model_depth(self):

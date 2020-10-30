@@ -7,7 +7,7 @@
 import logging
 from typing import Any, Dict
 
-from classy_vision.generic.distributed_util import is_master
+from classy_vision.generic.distributed_util import is_primary
 from classy_vision.generic.visualize import plot_model
 from classy_vision.hooks import register_hook
 from classy_vision.hooks.classy_hook import ClassyHook
@@ -39,15 +39,13 @@ class ModelTensorboardHook(ClassyHook):
         Args:
             tb_writer: `Tensorboard SummaryWriter <https://tensorboardx.
             readthedocs.io/en/latest/tensorboard.html#tensorboardX.
-            SummaryWriter>`_ instance
-
+            SummaryWriter>`_ instance or None (only on non-master replicas)
         """
         super().__init__()
         if not tb_available:
-            raise RuntimeError(
+            raise ModuleNotFoundError(
                 "tensorboard not installed, cannot use ModelTensorboardHook"
             )
-
         self.tb_writer = tb_writer
 
     @classmethod
@@ -65,7 +63,7 @@ class ModelTensorboardHook(ClassyHook):
         """
         Plot the model on Tensorboard.
         """
-        if is_master():
+        if is_primary():
             try:
                 # Show model in tensorboard:
                 logging.info("Showing model graph in TensorBoard...")
@@ -79,6 +77,5 @@ class ModelTensorboardHook(ClassyHook):
                     writer=self.tb_writer,
                 )
             except Exception:
-                logging.warn(
-                    "Unable to plot model to tensorboard. Exception: ", exc_info=True
-                )
+                logging.warn("Unable to plot model to tensorboard")
+                logging.debug("Exception encountered:", exc_info=True)

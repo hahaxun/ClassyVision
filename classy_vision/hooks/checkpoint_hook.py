@@ -7,11 +7,20 @@
 import logging
 from typing import Any, Collection, Dict, Optional  # noqa
 
-from classy_vision.generic.distributed_util import is_master
+from classy_vision.generic.distributed_util import is_primary
 from classy_vision.generic.util import get_checkpoint_dict, save_checkpoint
 from classy_vision.hooks import register_hook
 from classy_vision.hooks.classy_hook import ClassyHook
 from fvcore.common.file_io import PathManager
+
+
+gfs_prefix_list = {
+    "/mnt/gfsdataswarm",
+    "/mnt/gfsdataswarm-global",
+    "/mnt/vol",
+    "/mnt/shared",
+    "/mnt/homedir",
+}
 
 
 @register_hook("checkpoint")
@@ -78,6 +87,13 @@ class CheckpointHook(ClassyHook):
             self.checkpoint_folder
         ), "Checkpoint folder '{}' deleted unexpectedly".format(self.checkpoint_folder)
 
+        for prefix in gfs_prefix_list:
+            if self.checkpoint_folder.startswith(prefix):
+                logging.warning(
+                    "GFS is deprecating... please save checkpoint to manifold!"
+                )
+                break
+
         # save checkpoint:
         logging.info("Saving checkpoint to '{}'...".format(self.checkpoint_folder))
         checkpoint_file = save_checkpoint(
@@ -88,7 +104,7 @@ class CheckpointHook(ClassyHook):
         PathManager.copy(checkpoint_file, f"{self.checkpoint_folder}/{filename}")
 
     def on_start(self, task) -> None:
-        if not is_master() or getattr(task, "test_only", False):
+        if not is_primary() or getattr(task, "test_only", False):
             return
         if not PathManager.exists(self.checkpoint_folder):
             err_msg = "Checkpoint folder '{}' does not exist.".format(
@@ -101,7 +117,7 @@ class CheckpointHook(ClassyHook):
 
         We do not necessarily checkpoint the task at the end of every phase.
         """
-        if not is_master() or task.phase_type not in self.phase_types:
+        if not is_primary() or task.phase_type not in self.phase_types:
             return
 
         self.phase_counter += 1

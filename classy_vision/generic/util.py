@@ -8,17 +8,15 @@ import collections
 import contextlib
 import json
 import logging
-import math
 import os
-import sys
-import traceback
+import time
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-from classy_vision.generic.distributed_util import broadcast_object, is_master
+from classy_vision.generic.distributed_util import broadcast_object, is_primary
 from fvcore.common.file_io import PathManager
 from torch._six import container_abcs
 
@@ -26,6 +24,7 @@ from torch._six import container_abcs
 # constants:
 CHECKPOINT_FILE = "checkpoint.torch"
 CPU_DEVICE = torch.device("cpu")
+GPU_DEVICE = torch.device("cuda")
 
 
 def is_pos_int(number: int) -> bool:
@@ -142,7 +141,40 @@ def copy_model_to_gpu(model, loss=None):
         return model
 
 
-def recursive_copy_to_gpu(value: Any, non_blocking: Dict = True) -> Any:
+def recursive_copy_to_device(
+    value: Any, non_blocking: bool, device: torch.device
+) -> Any:
+    """
+    Recursively searches lists, tuples, dicts and copies tensors to device if
+    possible. Non-tensor values are passed as-is in the result.
+
+    Note:  These are all copies, so if there are two objects that reference
+    the same object, then after this call, there will be two different objects
+    referenced on the device.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=non_blocking)
+    elif isinstance(value, list) or isinstance(value, tuple):
+        device_val = []
+        for val in value:
+            device_val.append(
+                recursive_copy_to_device(val, non_blocking=non_blocking, device=device)
+            )
+
+        return device_val if isinstance(value, list) else tuple(device_val)
+    elif isinstance(value, container_abcs.Mapping):
+        device_val = {}
+        for key, val in value.items():
+            device_val[key] = recursive_copy_to_device(
+                val, non_blocking=non_blocking, device=device
+            )
+
+        return device_val
+
+    return value
+
+
+def recursive_copy_to_gpu(value: Any, non_blocking: bool = True) -> Any:
     """
     Recursively searches lists, tuples, dicts and copies tensors to GPU if
     possible. Non-tensor values are passed as-is in the result.
@@ -150,22 +182,9 @@ def recursive_copy_to_gpu(value: Any, non_blocking: Dict = True) -> Any:
     the same object, then after this call, there will be two different objects
     referenced on the GPU.
     """
-    if hasattr(value, "cuda"):
-        return value.cuda(non_blocking=non_blocking)
-    elif isinstance(value, list) or isinstance(value, tuple):
-        gpu_val = []
-        for val in value:
-            gpu_val.append(recursive_copy_to_gpu(val, non_blocking=non_blocking))
-
-        return gpu_val if isinstance(value, list) else tuple(gpu_val)
-    elif isinstance(value, container_abcs.Mapping):
-        gpu_val = {}
-        for key, val in value.items():
-            gpu_val[key] = recursive_copy_to_gpu(val, non_blocking=non_blocking)
-
-        return gpu_val
-
-    return value
+    return recursive_copy_to_device(
+        value=value, non_blocking=non_blocking, device=GPU_DEVICE
+    )
 
 
 @contextlib.contextmanager
@@ -206,7 +225,7 @@ def load_and_broadcast_checkpoint(
 
     See :func:`load_checkpoint` for the arguments.
     """
-    if is_master():
+    if is_primary():
         checkpoint = load_checkpoint(checkpoint_path, device)
     else:
         checkpoint = None
@@ -255,7 +274,9 @@ def load_checkpoint(
     return checkpoint
 
 
-def update_classy_model(model, model_state_dict: Dict, reset_heads: bool) -> bool:
+def update_classy_model(
+    model, model_state_dict: Dict, reset_heads: bool, strict: bool = True
+) -> bool:
     """
     Updates the model with the provided model state dictionary.
 
@@ -264,6 +285,8 @@ def update_classy_model(model, model_state_dict: Dict, reset_heads: bool) -> boo
         model_state_dict: State dict, should be the output of a call to
             ClassyVisionModel.get_classy_state().
         reset_heads: if False, uses the heads' state from model_state_dict.
+        strict: if True, strictly match the module/buffer keys in current model and
+            pass-in model_state_dict
     """
     try:
         if reset_heads:
@@ -272,7 +295,7 @@ def update_classy_model(model, model_state_dict: Dict, reset_heads: bool) -> boo
             model_state_dict["model"]["heads"] = current_model_state_dict["model"][
                 "heads"
             ]
-        model.set_classy_state(model_state_dict)
+        model.set_classy_state(model_state_dict, strict=strict)
         logging.info("Model state load successful")
         return True
     except Exception:
@@ -457,6 +480,23 @@ def get_model_dummy_input(
     return input
 
 
+def get_batchsize_per_replica(x: Union[Tuple, List, Dict]) -> int:
+    """
+    Some layer may take tuple/list/dict/list[dict] as input in forward function. We
+    recursively dive into the tuple/list until we meet a tensor and infer the batch size
+    """
+    while isinstance(x, (list, tuple)):
+        assert len(x) > 0, "input x of tuple/list type must have at least one element"
+        x = x[0]
+
+    if isinstance(x, (dict,)):
+        # index zero is always equal to batch size. select an arbitrary key.
+        key_list = list(x.keys())
+        x = x[key_list[0]]
+
+    return x.size()[0]
+
+
 def split_batchnorm_params(model: nn.Module):
     """Finds the set of BatchNorm parameters in the model.
 
@@ -484,6 +524,29 @@ def split_batchnorm_params(model: nn.Module):
     return batchnorm_params, other_params
 
 
+class Timer:
+    """Timer context manager to get the elapsed time for a code block.
+
+    Example:
+        .. code-block:: python
+
+            with Timer() as timer:
+                do_something()
+            elapsed_time = timer.elapsed_time
+    """
+
+    def __init__(self):
+        self.start = 0
+        self.elapsed_time = 0
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.elapsed_time = time.perf_counter() - self.start
+
+
 @contextlib.contextmanager
 def _train_mode(model: nn.Module, train_mode: bool):
     """Context manager which sets the train mode of a model. After returning, it
@@ -497,6 +560,18 @@ def _train_mode(model: nn.Module, train_mode: bool):
     finally:
         for name, module in model.named_modules():
             module.training = train_modes[name]
+
+
+def log_class_usage(component_type, klass):
+    """This function is used to log the usage of different Classy components."""
+    identifier = "ClassyVision"
+    if klass and hasattr(klass, "__name__"):
+        identifier += f".{component_type}.{klass.__name__}"
+    torch._C._log_api_usage_once(identifier)
+
+
+def get_torch_version():
+    return torch.__version__[:3]
 
 
 train_model = partial(_train_mode, train_mode=True)

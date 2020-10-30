@@ -52,10 +52,11 @@ if __name__ == "__main__":
                 "GitPython",
                 "black==19.3b0",
                 "sphinx",
-                "isort",
+                "isort==5.2.2",
                 "bs4",
                 "nbconvert",
                 "pre-commit",
+                "parameterized",
             ]
         },
         package_data={"classy_vision": ["configs/*.json", "templates"]},

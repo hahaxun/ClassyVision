@@ -9,17 +9,42 @@ import shutil
 import tempfile
 import unittest
 from test.generic.config_utils import get_fast_test_task_config, get_test_task_config
-from test.generic.utils import compare_model_state, compare_samples, compare_states
+from test.generic.utils import (
+    LimitedPhaseTrainer,
+    compare_model_state,
+    compare_samples,
+    compare_states,
+)
 
 import torch
 from classy_vision.dataset import build_dataset
+from classy_vision.generic.distributed_util import is_distributed_training_run
 from classy_vision.generic.util import get_checkpoint_dict
 from classy_vision.hooks import CheckpointHook, LossLrMeterLoggingHook
-from classy_vision.losses import build_loss
+from classy_vision.losses import ClassyLoss, build_loss, register_loss
 from classy_vision.models import build_model
 from classy_vision.optim import build_optimizer
 from classy_vision.tasks import ClassificationTask, build_task
 from classy_vision.trainer import LocalTrainer
+
+
+@register_loss("test_stateful_loss")
+class TestStatefulLoss(ClassyLoss):
+    def __init__(self, in_plane):
+        super(TestStatefulLoss, self).__init__()
+
+        self.alpha = torch.nn.Parameter(torch.Tensor(in_plane, 2))
+        torch.nn.init.xavier_normal(self.alpha)
+
+    @classmethod
+    def from_config(cls, config) -> "TestStatefulLoss":
+        return cls(in_plane=config["in_plane"])
+
+    def forward(self, output, target):
+        value = output.matmul(self.alpha)
+        loss = torch.mean(torch.abs(value))
+
+        return loss
 
 
 class TestClassificationTask(unittest.TestCase):
@@ -106,29 +131,21 @@ class TestClassificationTask(unittest.TestCase):
 
         task.set_use_gpu(torch.cuda.is_available())
 
-        # prepare the tasks for the right device
-        task.prepare()
+        # only train 1 phase at a time
+        trainer = LimitedPhaseTrainer(num_phases=1)
 
-        # test in both train and test mode
-        for _ in range(2):
-            task.advance_phase()
-
+        while not task.done_training():
             # set task's state as task_2's checkpoint
             task_2._set_checkpoint_dict(get_checkpoint_dict(task, {}, deep_copy=True))
-            task_2.prepare()
 
-            # task 2 should have the same state
+            # task 2 should have the same state before training
             self._compare_states(task.get_classy_state(), task_2.get_classy_state())
 
-            # this tests that both states' iterators return the same samples
-            sample = next(task.get_data_iterator())
-            sample_2 = next(task_2.get_data_iterator())
-            self._compare_samples(sample, sample_2)
+            # train for one phase
+            trainer.train(task)
+            trainer.train(task_2)
 
-            # test that the train step runs the same way on both states
-            # and the loss remains the same
-            task.train_step()
-            task_2.train_step()
+            # task 2 should have the same state after training
             self._compare_states(task.get_classy_state(), task_2.get_classy_state())
 
     def test_final_train_checkpoint(self):
@@ -145,10 +162,7 @@ class TestClassificationTask(unittest.TestCase):
         trainer = LocalTrainer()
         trainer.train(task)
 
-        # make sure fetching the where raises an exception, which means that
-        # where is >= 1.0
-        with self.assertRaises(Exception):
-            task.where
+        self.assertAlmostEqual(task.where, 1.0, delta=1e-3)
 
         # set task_2's state as task's final train checkpoint
         task_2.set_checkpoint(self.base_dir)
@@ -260,3 +274,13 @@ class TestClassificationTask(unittest.TestCase):
             trainer = LocalTrainer()
             task_2.set_use_gpu(not use_gpu)
             trainer.train(task_2)
+
+    @unittest.skipUnless(
+        is_distributed_training_run(), "This test needs a distributed run"
+    )
+    def test_get_classy_state_on_loss(self):
+        config = get_fast_test_task_config()
+        config["loss"] = {"name": "test_stateful_loss", "in_plane": 256}
+        task = build_task(config)
+        task.prepare()
+        self.assertIn("alpha", task.get_classy_state()["loss"])
