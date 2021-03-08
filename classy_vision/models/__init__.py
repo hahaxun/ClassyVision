@@ -9,7 +9,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from classy_vision.generic.registry_utils import import_all_modules
-from classy_vision.generic.util import log_class_usage
 from classy_vision.heads import build_head
 
 from .classy_model import ClassyModel
@@ -81,8 +80,6 @@ def build_model(config):
             heads[fork_block].append(head)
         model.set_heads(heads)
 
-    log_class_usage("Model", model.__class__)
-
     return model
 
 
@@ -96,17 +93,17 @@ from .classy_model import (  # isort:skip
 )  # isort:skip
 from .densenet import DenseNet  # isort:skip
 from .efficientnet import EfficientNet  # isort:skip
+from .lecun_normal_init import lecun_normal_init  # isort:skip
 from .mlp import MLP  # isort:skip
 from .regnet import RegNet  # isort:skip
 from .resnet import ResNet  # isort:skip
 from .resnext import ResNeXt  # isort:skip
 from .resnext3d import ResNeXt3D  # isort:skip
 from .squeeze_and_excitation_layer import SqueezeAndExcitationLayer  # isort:skip
+from .vision_transformer import VisionTransformer  # isort:skip
 
 
 __all__ = [
-    "build_model",
-    "register_model",
     "ClassyBlock",
     "ClassyModel",
     "ClassyModelHeadExecutorWrapper",
@@ -119,4 +116,8 @@ __all__ = [
     "ResNeXt",
     "ResNeXt3D",
     "SqueezeAndExcitationLayer",
+    "VisionTransformer",
+    "build_model",
+    "lecun_normal_init",
+    "register_model",
 ]

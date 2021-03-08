@@ -537,14 +537,6 @@ class RegNet(ClassyModel):
                 m.weight.data.normal_(mean=0.0, std=0.01)
                 m.bias.data.zero_()
 
-    @property
-    def input_shape(self):
-        return (3, 224, 224)
-
-    @property
-    def model_depth(self):
-        return self.stem.depth + self.trunk_depth
-
 
 # Register some "classic" RegNets
 class _RegNet(RegNet):

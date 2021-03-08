@@ -95,16 +95,20 @@ def register_optimizer(name):
 import_all_modules(FILE_ROOT, "classy_vision.optim")
 
 from .adam import Adam  # isort:skip
+from .adamw import AdamW  # isort:skip
 from .rmsprop import RMSProp  # isort:skip
 from .rmsprop_tf import RMSPropTF  # isort:skip
 from .sgd import SGD  # isort:skip
+from .zero import ZeRO  # isort:skip
 
 __all__ = [
     "Adam",
+    "AdamW",
     "ClassyOptimizer",
     "RMSProp",
     "RMSPropTF",
     "SGD",
+    "ZeRO",
     "build_optimizer",
     "build_optimizer_schedulers",
     "register_optimizer",

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from classy_vision.generic.util import log_class_usage
 from classy_vision.heads.classy_head import ClassyHead
 
 from .classy_block import ClassyBlock
@@ -157,6 +158,8 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
         self._attachable_block_names = []
         self._heads = nn.ModuleDict()
         self._head_outputs = {}
+
+        log_class_usage("Model", self.__class__)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "ClassyModel":
@@ -404,13 +407,11 @@ class ClassyModel(nn.Module, metaclass=_ClassyModelMeta):
 
     @property
     def input_shape(self):
-        """If implemented, returns expected input tensor shape"""
-        raise NotImplementedError
+        """Returns the input shape that the model can accept, excluding the batch dimension.
 
-    @property
-    def model_depth(self):
-        """If implemented, returns number of layers in model"""
-        raise NotImplementedError
+        By default it returns (3, 224, 224).
+        """
+        return (3, 224, 224)
 
 
 class _ClassyModelAdapter(ClassyModel):
@@ -446,9 +447,3 @@ class _ClassyModelAdapter(ClassyModel):
         if self._input_shape is not None:
             return self._input_shape
         return super().input_shape
-
-    @property
-    def model_depth(self):
-        if self._model_depth is not None:
-            return self._model_depth
-        return super().model_depth

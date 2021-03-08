@@ -19,6 +19,7 @@ import torch.nn as nn
 from classy_vision.generic.util import (
     CHECKPOINT_FILE,
     Timer,
+    get_torch_version,
     load_checkpoint,
     save_checkpoint,
     split_batchnorm_params,
@@ -46,9 +47,23 @@ def get_mock_tensor(mock_class):
 
 
 class TestUtilMethods(unittest.TestCase):
+    class StructuredInput:
+        def __init__(self, tensor_a, tensor_b):
+            self.tensor_a = tensor_a
+            self.tensor_b = tensor_b
+
+        def to(self, device, non_blocking):
+            return TestUtilMethods.StructuredInput(
+                tensor_a=self.tensor_a.to(device=device, non_blocking=non_blocking),
+                tensor_b=self.tensor_b.to(device=device, non_blocking=non_blocking),
+            )
+
     def test_recursive_copy_to_gpu(self):
         tensor_a = get_mock_tensor()
         tensor_b = get_mock_tensor()
+        tensor_structured = TestUtilMethods.StructuredInput(
+            tensor_a=get_mock_tensor(), tensor_b=get_mock_tensor()
+        )
 
         valid_gpu_copy_value = tensor_a
         gpu_value = util.recursive_copy_to_gpu(valid_gpu_copy_value)
@@ -75,6 +90,11 @@ class TestUtilMethods(unittest.TestCase):
 
         value = {"a": "b"}
         self.assertEqual(value, util.recursive_copy_to_gpu(value))
+
+        valid_gpu_copy_structured = tensor_structured
+        gpu_value = util.recursive_copy_to_gpu(valid_gpu_copy_structured)
+        self.assertTrue(gpu_value.tensor_a.is_cuda)
+        self.assertTrue(gpu_value.tensor_b.is_cuda)
 
     _json_config_file = ROOT / "generic_util_json_blob_test.json"
 
@@ -327,3 +347,14 @@ class TestCheckpointFunctions(unittest.TestCase):
         checkpoint_path = f"{self.base_dir}/{filename}"
         loaded_checkpoint = load_checkpoint(checkpoint_path)
         self.assertDictEqual(checkpoint_dict, loaded_checkpoint)
+
+    @mock.patch("classy_vision.generic.util.torch")
+    def test_get_torch_version(self, mock_torch: mock.MagicMock):
+        mock_torch.__version__ = "1.7.2"
+        self.assertEqual(get_torch_version(), [1, 7])
+        self.assertLess(get_torch_version(), [1, 8])
+        self.assertGreater(get_torch_version(), [1, 6])
+        mock_torch.__version__ = "1.11.2a"
+        self.assertEqual(get_torch_version(), [1, 11])
+        self.assertLess(get_torch_version(), [1, 13])
+        self.assertGreater(get_torch_version(), [1, 8])

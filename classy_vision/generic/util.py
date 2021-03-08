@@ -18,7 +18,14 @@ import torch
 import torch.nn as nn
 from classy_vision.generic.distributed_util import broadcast_object, is_primary
 from fvcore.common.file_io import PathManager
-from torch._six import container_abcs
+
+
+try:
+    import apex
+
+    apex_available = True
+except ImportError:
+    apex_available = False
 
 
 # constants:
@@ -90,7 +97,7 @@ def is_leaf(module: nn.Module) -> bool:
     Returns True if module is leaf in the graph.
     """
     assert isinstance(module, nn.Module), "module should be nn.Module"
-    return len([c for c in module.children()]) == 0 or hasattr(module, "_mask")
+    return len(list(module.children())) == 0 or hasattr(module, "_mask")
 
 
 def is_on_gpu(model: torch.nn.Module) -> bool:
@@ -145,16 +152,15 @@ def recursive_copy_to_device(
     value: Any, non_blocking: bool, device: torch.device
 ) -> Any:
     """
-    Recursively searches lists, tuples, dicts and copies tensors to device if
-    possible. Non-tensor values are passed as-is in the result.
+    Recursively searches lists, tuples, dicts and copies any object which
+    supports an object.to API (e.g. tensors) to device if possible.
+    Other values are passed as-is in the result.
 
     Note:  These are all copies, so if there are two objects that reference
     the same object, then after this call, there will be two different objects
     referenced on the device.
     """
-    if isinstance(value, torch.Tensor):
-        return value.to(device, non_blocking=non_blocking)
-    elif isinstance(value, list) or isinstance(value, tuple):
+    if isinstance(value, list) or isinstance(value, tuple):
         device_val = []
         for val in value:
             device_val.append(
@@ -162,7 +168,7 @@ def recursive_copy_to_device(
             )
 
         return device_val if isinstance(value, list) else tuple(device_val)
-    elif isinstance(value, container_abcs.Mapping):
+    elif isinstance(value, collections.abc.Mapping):
         device_val = {}
         for key, val in value.items():
             device_val[key] = recursive_copy_to_device(
@@ -170,6 +176,8 @@ def recursive_copy_to_device(
             )
 
         return device_val
+    elif callable(getattr(value, "to", None)):
+        return value.to(device=device, non_blocking=non_blocking)
 
     return value
 
@@ -571,7 +579,13 @@ def log_class_usage(component_type, klass):
 
 
 def get_torch_version():
-    return torch.__version__[:3]
+    """Get the torch version as [major, minor].
+
+    All comparisons must be done with the two version values. Revisions are not
+    supported.
+    """
+    version_list = torch.__version__.split(".")[:2]
+    return [int(version_str) for version_str in version_list]
 
 
 train_model = partial(_train_mode, train_mode=True)
@@ -586,3 +600,16 @@ eval_model.__doc__ = """Context manager which puts the model in eval mode.
 
     After returning, it restores the state of every sub-module individually.
     """
+
+
+def master_params(optimizer):
+    """Generator to iterate over all parameters in the optimizer param_groups.
+
+    When apex is available, uses that to guarantee we get the FP32 copy of the
+    parameters when O2 is enabled. Otherwise, iterate ourselves."""
+    if apex_available:
+        yield from apex.amp.master_params(optimizer)
+    else:
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                yield p

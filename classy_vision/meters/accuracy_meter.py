@@ -25,6 +25,8 @@ class AccuracyMeter(ClassyMeter):
         args:
             topk: list of int `k` values.
         """
+        super().__init__()
+
         assert isinstance(topk, list), "topk must be a list"
         assert len(topk) > 0, "topk list should have at least one element"
         assert [is_pos_int(x) for x in topk], "each value in topk must be >= 1"
@@ -137,7 +139,12 @@ class AccuracyMeter(ClassyMeter):
         # Convert target to 0/1 encoding if isn't
         target, model_output = maybe_convert_to_one_hot(target, model_output)
 
-        _, pred = model_output.topk(max(self._topk), dim=1, largest=True, sorted=True)
+        # If Pytorch AMP is being used, model outputs are probably fp16
+        # Since .topk() is not compatible with fp16, we promote the model outputs to full precision
+        _, pred = model_output.float().topk(
+            max(self._topk), dim=1, largest=True, sorted=True
+        )
+
         for i, k in enumerate(self._topk):
             self._curr_correct_predictions_k[i] += (
                 torch.gather(target, dim=1, index=pred[:, :k])
